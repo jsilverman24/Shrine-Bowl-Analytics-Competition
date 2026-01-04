@@ -1,0 +1,212 @@
+library(arrow)
+library(tidyverse)
+library(psych)
+data_dictionary <- read_csv('~/Desktop/Shrine Bowl Data/competition_data_dictionary.csv')
+timestamps <- read_csv('~/Desktop/Shrine Bowl Data/session_timestamps.csv')
+college_stats <- read_csv('~/Desktop/Shrine Bowl Data/shrine_bowl_players_college_stats.csv') 
+nfl_rookie_stats <- read_csv('~/Desktop/Shrine Bowl Data/shrine_bowl_players_nfl_rookie_stats.csv')
+
+#DRILL EVALUATION METRIC: Using historical East-West Shrine Bowl practice data, create an objective metric for evaluating a drill.
+
+#East22_practice1 <- read_parquet("~/Desktop/Shrine Bowl Data/2022_East_Practice_1.snappy.parquet")
+#West22_practice1 <- read_parquet("~/Desktop/Shrine Bowl Data/2022_West_Practice_1.snappy.parquet")
+#West24_practice1 <- read_parquet("~/Desktop/Shrine Bowl Data/2024_West_Practice_1.snappy.parquet")
+#West24_practice2 <- read_parquet("~/Desktop/Shrine Bowl Data/2024_West_Practice_2.snappy.parquet")
+#East24_practice3 <- read_parquet("~/Desktop/Shrine Bowl Data/2024_East_Practice_3.snappy.parquet")
+#East24_practice2 <- read_parquet("~/Desktop/Shrine Bowl Data/2024_East_Practice_2.snappy.parquet")
+#East24_practice1 <- read_parquet("~/Desktop/Shrine Bowl Data/2024_East_Practice_1.snappy.parquet")
+#unique(East24_practice3$drill_type)
+
+#all my drills - "Indy", "1v1", "7v7","Team 1", "Team 2", "Team 3", "Team Up","2 Minute Drill","Special Teams", "Specialists", "Stretch", "SY & GL", "Move The Ball", "Pre-Practice", "Cross Over", "Indy/1v1", "9v7/1v1","Bigs 1 on 1 - Skill 7 on 7", "SPT 2", "SPT", "Best of 1 on 1", "Bigs 9 on 7 - Skill 1 on 1", "Team", "Combo", "Team Job Thru"
+#"SPT JOG Thru", "STRETCH"
+#define all the drills i want to evaluate
+
+drills <- c(
+  "Indy", "1v1", 
+  "Special Teams", "Specialists", "SY & GL", "Indy/1v1", "9v7/1v1",
+  "Bigs 1 on 1 - Skill 7 on 7", "SPT 2", "SPT", "Best of 1 on 1", "Bigs 9 on 7 - Skill 1 on 1"
+)
+
+#define the parquet files. Practice files is our input for every parquet
+practice_files <- list.files(
+  "~/Desktop/Shrine Bowl Data",
+  pattern = "Practice.*\\.parquet$",
+  full.names = TRUE
+)
+#this creates a function for each drill.
+get_drill_frames <- function(drill) {
+  #this loops over every practice file
+  bind_rows(lapply(practice_files, function(path) {
+    #and opens it
+    open_dataset(path, format = "parquet") %>%
+      #and filters for each drill
+      filter(drill_type == drill, entity_type == "player") %>%
+      #and collects
+      collect()
+  }))
+}
+
+#here is our function
+dem_function <- function(
+    #drill input
+    drill, 
+    #weights
+    w1 = 0.25, w2 = 0.25, w3 = 0.25, w4 = 0.25
+) {
+  
+  #get active drills
+  drill_active <- drill %>%
+    mutate(
+      active = if_else(
+        #if speed is above .1 y/s or a is above .1 a/s
+        s >= 0.1 | abs(a) > 0.1,
+        #T
+        TRUE,
+        FALSE
+      )
+    )
+  
+  #get intensity
+  player_drill <- drill_active %>% 
+    #only when players are active
+    filter(active == TRUE) %>% 
+    group_by(dataset_id, gsis_id) %>% 
+    summarize(
+      mean_s = mean(s, na.rm = TRUE),
+      mean_a = mean(abs(a), na.rm = TRUE),
+      p_90_s = quantile(s, .90, na.rm = TRUE),
+      p90_abs_a = quantile(abs(a), 0.90, na.rm = TRUE),
+      max_s = max(s, na.rm = TRUE),
+      max_a = max(a, na.rm = TRUE),
+      min_s = min(s, na.rm = TRUE),
+      min_a = min(abs(a), na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  #Engagement - how active a player is throughout a drill
+  #in percent of frames
+  engagement_drill <- drill_active %>% 
+    #group by player and dataset
+    group_by(dataset_id, gsis_id) %>% 
+    #get number of rows
+    summarize(
+      rows = n(),
+      #get number of active rows
+      active_rows = sum(active),
+      #divide
+      engagement = active_rows / rows,
+      .groups = "drop"
+    )
+  
+  #discrimination - how easy it is to see who performs well or pooly in a drill
+  discrimination_drill <- player_drill %>% 
+    group_by(dataset_id) %>%
+    #create variables
+    summarize(
+      #grab the IQR
+      discrimination = IQR(p_90_s, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  #Stability - does it evaluate players in similar ways, meaning coaches can trust its results. Lets get cronbachs alpha
+  #lets get the chunked 
+  drill_chunked <- drill_active %>%
+    #filter for active 
+    filter(active == TRUE) %>%
+    #group by player and dataset
+    group_by(dataset_id, gsis_id) %>%
+    #create 4 time chunks throughout a player's drill frames
+    mutate(chunk = ntile(row_number(), 4)) %>%   
+    ungroup()
+  
+  #now lets group by chunk
+  player_chunks <- drill_chunked %>%
+    group_by(dataset_id, gsis_id, chunk) %>%
+    #get p_90_s for each one
+    summarize(
+      p_90_s = quantile(s, 0.90, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  #lets calculate cronbach's alpha
+  stability_drill <- player_chunks %>%
+    #this creates variables for each chunk. so there are 4 chunks so there are 4 columns. and takes the p 90 s values
+    pivot_wider(names_from = chunk, values_from = p_90_s) %>%
+    group_by(dataset_id) %>%
+    #computes Cronbach’s alpha for one drill using the chunked player scores
+    summarize(
+      stability_alpha = tryCatch({
+        #only take the current data without the player ids
+        X <- select(cur_data(), -gsis_id) %>% as.data.frame()
+        #get alpha and return NA if not enough data
+        suppressMessages(suppressWarnings(
+          psych::alpha(X, check.keys = FALSE, na.rm = TRUE)$total$raw_alpha
+        ))
+      }, error = function(e) NA_real_),
+      n_players = n(),
+      .groups = "drop"
+    )
+  #get intensity per drill through the mean
+  intensity_drill <- player_drill %>%
+    group_by(dataset_id) %>%
+    summarize(
+      intensity = mean(p_90_s, na.rm = TRUE),
+      .groups = "drop"
+    )
+  #get the mean engagement
+  engagement_by_dataset <- engagement_drill %>%
+    group_by(dataset_id) %>%
+    summarize(
+      engagement = mean(engagement, na.rm = TRUE),
+      .groups = "drop"
+    )
+  #get the drill metric by creating one dataset 
+  drill_metrics <- intensity_drill %>%
+    left_join(engagement_by_dataset, by = "dataset_id") %>%
+    left_join(discrimination_drill, by = "dataset_id") %>%
+    left_join(stability_drill, by = "dataset_id") %>% 
+    mutate(
+      DEM = w1 * intensity +
+        w2 * engagement +
+        w3 * discrimination +
+        w4 * stability_alpha
+    )
+  drill_DEM <- drill_metrics %>% 
+    summarize(
+      DEM = mean(DEM, na.rm = TRUE),
+      n_datasets = n(),
+      avg_players = mean(n_players, na.rm = TRUE)
+    )
+  
+  
+  return(drill_DEM)
+}
+#run per drill
+#lets do the function for all the drills. input the drills vectors into the function d
+all_drill_dem <- bind_rows(lapply(drills, function(d) {
+  #create drill_df by running the function earlier for each drill
+  drill_df <- get_drill_frames(d)
+  #run the dem function for the data frame drill 
+  dem_function(drill_df) %>%
+    #make the drill equal to drill type
+    mutate(drill_type = d) %>%
+    #grab the drill and type
+    select(drill_type, DEM)
+}))
+
+#arrange the order
+all_drill_dem %>% arrange(desc(DEM))
+#SPT 2                       1.17
+#2 Bigs 1 on 1 - Skill 7 on 7  1.16
+#3 Best of 1 on 1              1.16
+#4 Bigs 9 on 7 - Skill 1 on 1  1.16
+#5 SPT                         1.13
+#6 Indy                        1.13
+#7 Indy/1v1                    1.12
+#8 9v7/1v1                     1.11
+#9 Special Teams               1.11
+#10 Specialists                 1.10
+#11 SY & GL                     1.07
+#12 1v1                         1.07
+
+
